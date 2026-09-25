@@ -1024,6 +1024,440 @@ SH
   pass "cycle-exit ledger links a verified successor and remains size-capped"
 }
 
+# The ledger is diagnostic evidence, so a lock this arm cannot take within its
+# bound must not stall the cycle. It must also not vanish: a record silently
+# dropped here reads exactly like a hand-over that never happened, which is the
+# alarm this ledger exists to raise. So the arm reports the skip on stderr and
+# still starts and confirms its successor.
+# A verified hand-over must survive a busy lifecycle ledger: the successor can
+# lose the race for the log's lock, and the arm is deliberately not allowed to
+# block on that race past its own retire budget. The disposition is therefore
+# recorded outside the lock first and applied by the next ledger write, so a
+# busy lock can defer a link but never drop it.
+test_cycle_successor_link_survives_a_busy_ledger() {
+  local dir state fakebin armout armerr check_file first_arm successor_arm successor_pid holder ready release i
+  dir=$(make_case cycle-ledger-link-deferred)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/first-arm.out"
+  check_file="$state/task.check.sh"
+  ready="$dir/ledger-lock-ready"
+  release="$dir/ledger-lock-release"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+printf 'done: synthetic abandoned-link cycle\n'
+SH
+  chmod 0700 "$check_file"
+  FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-check-register.sh" task >/dev/null \
+    || fail "could not register abandoned-link cycle-ledger check"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=0 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  first_arm=$!
+  wait "$first_arm" || fail "first abandoned-link ledger cycle did not surface its actionable wake"
+  drain_and_ack "$state" || fail "first abandoned-link ledger wake handling acknowledgement failed"
+  rm -f "$check_file" "$state/task.check-trust"
+
+  # Held until this test releases it, not for a fixed interval: the successor
+  # spends an unbounded-in-practice share of its own confirmation budget before
+  # it reaches the link, so a timed hold could still be inside the arm's ledger
+  # bound on a loaded machine and the abandonment would never happen.
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2" || exit 1
+    printf ready > "$3"
+    i=0
+    while [ ! -f "$4" ] && [ "$i" -lt 600 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    fm_lock_release "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$state/.watch-cycle-exits.lock" "$ready" "$release" &
+  holder=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ -f "$ready" ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -f "$ready" ] || fail "test could not hold the lifecycle ledger lock"
+
+  armout="$dir/successor-arm.out"
+  armerr="$dir/successor-arm.err"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$armerr" &
+  successor_arm=$!
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  successor_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  grep -qF "watcher: started pid=$successor_pid" "$armout" \
+    || fail "abandoned-link successor cycle did not start: $(cat "$armout")"
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF 'successor link deferred' "$armerr" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher-ledger: successor link deferred' "$armerr" \
+    || fail "arm did not report a ledger successor link it could not write: $(cat "$armerr")"
+  # The race must be real for this test to mean anything: while the lock is held
+  # the predecessor record is still unlinked, so only a disposition recorded
+  # outside that lock can carry the hand-over across it.
+  grep -q "arm_pid=$first_arm.*successor=none" "$state/.watch-cycle-exits.log" \
+    || fail "the successor linked its predecessor despite the held lifecycle ledger lock"
+  grep -q '^watcher: FAILED' "$armout" \
+    && fail "a deferred ledger write must not be reported as a watcher verdict: $(cat "$armout")"
+  # The relays that build a repair payload select the arm's verdict lines with
+  # ^watcher: over merged stdout+stderr and keep only the first few. A ledger
+  # diagnostic that matched that prefix could push the real verdict past the cut.
+  grep -E '^(watcher:|signal:|stale:|check:|heartbeat)' "$armerr" 2>/dev/null | grep -q 'deferred - ' \
+    && fail "a ledger diagnostic was emitted under a prefix the repair relays select: $(cat "$armerr")"
+  printf release > "$release"
+  wait "$holder" || fail "test lifecycle ledger lock holder failed"
+  # The recorded disposition is durable, so the successor's own cycle end applies
+  # it: the hand-over is reported as a started successor, not as a lost chain.
+  kill -HUP "$successor_arm" 2>/dev/null || true
+  wait "$successor_arm" 2>/dev/null || true
+  grep -q "arm_pid=$first_arm.*successor=started:$successor_pid" "$state/.watch-cycle-exits.log" \
+    || fail "a verified successor link was lost while the lifecycle ledger was busy: $(tail -3 "$state/.watch-cycle-exits.log")"
+  drain_and_ack "$state" || fail "recovery drain after deferred-link successor interruption failed"
+  pass "a verified successor link survives a busy lifecycle ledger"
+}
+
+# On the adapter paths that start the successor from a child-close handler, the
+# predecessor is still running its own close when the successor claims it, so its
+# record does not exist yet and the successor can never apply the claim itself.
+# The predecessor must therefore apply outstanding claims against the record it
+# has just written, or the hand-over expires unlinked at the claim horizon.
+test_cycle_successor_link_lands_on_a_predecessor_still_closing() {
+  local dir state fakebin armout succout first_arm successor_arm watcher_pid i
+  dir=$(make_case cycle-ledger-link-self)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/first-arm.out"
+  succout="$dir/successor-arm.out"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  first_arm=$!
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  grep -qF "watcher: started pid=$watcher_pid" "$armout" \
+    || fail "self-link predecessor cycle did not start: $(cat "$armout")"
+
+  # The successor claims a predecessor that is still live and has written no
+  # record at all, which is the interleaving a successor can never resolve.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$succout" &
+  successor_arm=$!
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF "watcher: attached pid=$watcher_pid" "$succout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$watcher_pid" "$succout" \
+    || fail "successor did not attach to the still-running predecessor's watcher: $(cat "$succout")"
+  ! grep -q "arm_pid=$first_arm" "$state/.watch-cycle-exits.log" 2>/dev/null \
+    || fail "the predecessor recorded its cycle before the claim, so this interleaving was not exercised"
+
+  kill -HUP "$first_arm" 2>/dev/null || true
+  wait "$first_arm" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -q "arm_pid=$first_arm" "$state/.watch-cycle-exits.log" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -q "arm_pid=$first_arm.*successor=attached:$watcher_pid" "$state/.watch-cycle-exits.log" \
+    || fail "a predecessor closing after its successor claimed it was left unlinked: $(tail -3 "$state/.watch-cycle-exits.log" 2>/dev/null)"
+
+  kill -HUP "$successor_arm" 2>/dev/null || true
+  wait "$successor_arm" 2>/dev/null || true
+  drain_and_ack "$state" || fail "recovery drain after a self-linked predecessor close failed"
+  pass "a predecessor still closing links the successor that already claimed it"
+}
+
+# A foreign watcher can win the singleton while this arm's own child stands
+# down. That winner is a verified healthy watcher, so the predecessor that
+# handed over to this arm did get a successor - but the child's close then runs
+# a branch (a delivered wake, or a nonzero exit) that records this arm's own row
+# and returns without ever publishing a claim, leaving the predecessor reading
+# successor=none with nothing on stderr. The fixture forces the nonzero-exit
+# branch by letting the child see the peer's beacon as stale while the arm still
+# sees it as fresh.
+test_cycle_successor_link_survives_a_foreign_singleton_winner() {
+  local dir state fakebin armout succout succerr peer_ready peer identity first_arm watcher_pid status i
+  dir=$(make_case cycle-ledger-link-foreign-winner)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/first-arm.out"
+  succout="$dir/successor-arm.out"
+  succerr="$dir/successor-arm.err"
+  peer_ready="$dir/peer.ready"
+
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  first_arm=$!
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  grep -qF "watcher: started pid=$watcher_pid" "$armout" \
+    || fail "foreign-winner predecessor cycle did not start: $(cat "$armout")"
+  kill -HUP "$first_arm" 2>/dev/null || true
+  wait "$first_arm" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -q "arm_pid=$first_arm" "$state/.watch-cycle-exits.log" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -q "arm_pid=$first_arm.*successor=none" "$state/.watch-cycle-exits.log" \
+    || fail "predecessor did not record an unlinked cycle: $(tail -3 "$state/.watch-cycle-exits.log" 2>/dev/null)"
+  # The foreign winner: a live, TERM-resistant holder of the singleton with a
+  # fresh beacon, so --restart cannot stop it and the arm confirms it healthy.
+  node -e 'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(process.argv[1], "ready\n"); setTimeout(() => {}, 300000)' "$peer_ready" &
+  peer=$!
+  i=0
+  while [ "$i" -lt 50 ] && [ ! -s "$peer_ready" ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ ! -s "$peer_ready" ]; then
+    kill -KILL "$peer" 2>/dev/null || true
+    wait "$peer" 2>/dev/null || true
+    fail "TERM-resistant foreign winner did not become ready"
+  fi
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") \
+    || fail "could not identify the foreign winner pid"
+  rm -rf "$state/.watch.lock"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  touch "$state/.last-watcher-beat"
+
+  # FM_WATCHER_STALE_GRACE applies to the child only; the arm's own freshness
+  # bound is FM_GUARD_GRACE, left at its default. The child therefore refuses
+  # the live holder and exits nonzero while the arm still sees that same holder
+  # as the healthy watcher that won the singleton. The stall bound stays high so
+  # the child never tries to evict the holder instead.
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" \
+    FM_WATCHER_STALE_GRACE=0 FM_WATCHER_STALL_BOUND=999999 \
+    FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_ARM_ATTACH_POLL=0.1 FM_ARM_CONFIRM_TIMEOUT=1 \
+    "$WATCH_ARM" --restart > "$succout" 2> "$succerr" || status=$?
+  [ "$status" -ne 0 ] \
+    || fail "successor arm exited zero though its child stood down nonzero: $(cat "$succout")"
+  grep -q 'reason=nonzero-exit' "$state/.watch-cycle-exits.log" \
+    || fail "the successor's child did not take the nonzero-exit close this case exercises: $(tail -3 "$state/.watch-cycle-exits.log" 2>/dev/null)"
+  is_live_non_zombie "$peer" || fail "the arm killed the foreign singleton winner"
+
+  grep -q "arm_pid=$first_arm.*successor=attached:$peer" "$state/.watch-cycle-exits.log" \
+    || fail "a predecessor whose successor lost the singleton to a verified foreign watcher was left unlinked: $(tail -3 "$state/.watch-cycle-exits.log" 2>/dev/null)"
+
+  kill -KILL "$peer" 2>/dev/null || true
+  wait "$peer" 2>/dev/null || true
+  pass "a foreign singleton winner still links the predecessor that handed over"
+}
+
+# The claim horizon exists to retire claims whose predecessor record never
+# appears, not to cancel a link that is still applicable. A deferred claim
+# routinely outlives the horizon, because the only remaining application point
+# is the successor's own cycle end and a healthy watcher cycle runs for hours.
+# An unlinked predecessor record that is still in the ledger must therefore win
+# over the claim's age.
+test_cycle_successor_link_outlives_the_claim_horizon() {
+  local dir state fakebin armout armerr check_file first_arm successor_arm successor_pid holder ready release i
+  dir=$(make_case cycle-ledger-link-horizon)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/first-arm.out"
+  check_file="$state/task.check.sh"
+  ready="$dir/ledger-lock-ready"
+  release="$dir/ledger-lock-release"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+printf 'done: synthetic horizon-link cycle\n'
+SH
+  chmod 0700 "$check_file"
+  FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-check-register.sh" task >/dev/null \
+    || fail "could not register horizon-link cycle-ledger check"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=0 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  first_arm=$!
+  wait "$first_arm" || fail "first horizon-link ledger cycle did not surface its actionable wake"
+  drain_and_ack "$state" || fail "first horizon-link ledger wake handling acknowledgement failed"
+  rm -f "$check_file" "$state/task.check-trust"
+
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2" || exit 1
+    printf ready > "$3"
+    i=0
+    while [ ! -f "$4" ] && [ "$i" -lt 600 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    fm_lock_release "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$state/.watch-cycle-exits.lock" "$ready" "$release" &
+  holder=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ -f "$ready" ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -f "$ready" ] || fail "test could not hold the lifecycle ledger lock"
+
+  armout="$dir/successor-arm.out"
+  armerr="$dir/successor-arm.err"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" FM_WATCH_CYCLE_LINK_HORIZON_S=1 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$armerr" &
+  successor_arm=$!
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  successor_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  grep -qF "watcher: started pid=$successor_pid" "$armout" \
+    || fail "horizon-link successor cycle did not start: $(cat "$armout")"
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF 'successor link deferred' "$armerr" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher-ledger: successor link deferred' "$armerr" \
+    || fail "the claim was never deferred, so the horizon is not exercised: $(cat "$armerr")"
+  grep -q "arm_pid=$first_arm.*successor=none" "$state/.watch-cycle-exits.log" \
+    || fail "the predecessor record was linked before the horizon could elapse"
+
+  # Outlive the successor's one-second horizon before anything can apply the
+  # claim, which is the ordinary case for a watcher cycle that runs for hours.
+  sleep 2
+  printf release > "$release"
+  wait "$holder" || fail "test lifecycle ledger lock holder failed"
+  kill -HUP "$successor_arm" 2>/dev/null || true
+  wait "$successor_arm" 2>/dev/null || true
+  grep -q "arm_pid=$first_arm.*successor=started:$successor_pid" "$state/.watch-cycle-exits.log" \
+    || fail "an applicable link was cancelled by the claim horizon: $(tail -3 "$state/.watch-cycle-exits.log")"
+  drain_and_ack "$state" || fail "recovery drain after horizon-link successor interruption failed"
+  pass "a claim past its horizon still links a predecessor record that is present and unlinked"
+}
+
+# Only the claim writer produces these files, so a claim that reads back as
+# nothing is a read failure, not invalid content. Retiring it would delete a
+# perfectly good hand-over record, which is the loss this whole mechanism exists
+# to prevent, so an unreadable claim must survive to the next reconcile.
+test_unreadable_claim_is_retried_not_retired() {
+  local dir state fakebin armout armerr claim check_file first_arm successor_arm successor_pid third_arm holder ready release i
+  dir=$(make_case cycle-ledger-link-unreadable)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/first-arm.out"
+  check_file="$state/task.check.sh"
+  ready="$dir/ledger-lock-ready"
+  release="$dir/ledger-lock-release"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+printf 'done: synthetic unreadable-claim cycle\n'
+SH
+  chmod 0700 "$check_file"
+  FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-check-register.sh" task >/dev/null \
+    || fail "could not register unreadable-claim cycle-ledger check"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=0 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  first_arm=$!
+  wait "$first_arm" || fail "first unreadable-claim ledger cycle did not surface its actionable wake"
+  drain_and_ack "$state" || fail "first unreadable-claim ledger wake handling acknowledgement failed"
+  rm -f "$check_file" "$state/task.check-trust"
+
+  FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2" || exit 1
+    printf ready > "$3"
+    i=0
+    while [ ! -f "$4" ] && [ "$i" -lt 600 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    fm_lock_release "$2"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$state/.watch-cycle-exits.lock" "$ready" "$release" &
+  holder=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ -f "$ready" ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -f "$ready" ] || fail "test could not hold the lifecycle ledger lock"
+
+  armout="$dir/successor-arm.out"
+  armerr="$dir/successor-arm.err"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WATCH_PREDECESSOR_ARM_PID="$first_arm" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2> "$armerr" &
+  successor_arm=$!
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  successor_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  grep -qF "watcher: started pid=$successor_pid" "$armout" \
+    || fail "unreadable-claim successor cycle did not start: $(cat "$armout")"
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF 'successor link deferred' "$armerr" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher-ledger: successor link deferred' "$armerr" \
+    || fail "the claim was never deferred, so no pending claim exists to read: $(cat "$armerr")"
+
+  claim="$state/.watch-cycle-links/$successor_arm.claim"
+  [ -f "$claim" ] || fail "the successor published no durable claim to make unreadable"
+  chmod 0000 "$claim" || fail "could not make the pending claim unreadable"
+  printf release > "$release"
+  wait "$holder" || fail "test lifecycle ledger lock holder failed"
+
+  # This close reconciles while the claim cannot be read. Retiring it here is
+  # the defect: the record is valid and its predecessor row is still unlinked.
+  kill -HUP "$successor_arm" 2>/dev/null || true
+  wait "$successor_arm" 2>/dev/null || true
+  [ -f "$claim" ] || fail "a claim that could not be read was deleted instead of retried"
+  chmod 0600 "$claim" || fail "could not restore the pending claim"
+  drain_and_ack "$state" || fail "recovery drain after unreadable-claim successor interruption failed"
+
+  armout="$dir/third-arm.out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" &
+  third_arm=$!
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$armout" || fail "the reconciling cycle did not start: $(cat "$armout")"
+  kill -HUP "$third_arm" 2>/dev/null || true
+  wait "$third_arm" 2>/dev/null || true
+  grep -q "arm_pid=$first_arm.*successor=started:$successor_pid" "$state/.watch-cycle-exits.log" \
+    || fail "the retried claim never linked its predecessor: $(tail -3 "$state/.watch-cycle-exits.log")"
+  drain_and_ack "$state" || fail "recovery drain after the reconciling cycle failed"
+  pass "a claim that could not be read is retried by the next reconcile instead of retired"
+}
+
 test_stopped_watcher_is_live_but_stale_then_exit_is_classified() {
   local dir state fakebin armout armpid watcher_pid i status
   dir=$(make_case stopped-watcher)
@@ -1279,4 +1713,9 @@ test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
 test_cycle_exit_ledger_links_successor_and_stays_bounded
+test_cycle_successor_link_survives_a_busy_ledger
+test_cycle_successor_link_lands_on_a_predecessor_still_closing
+test_cycle_successor_link_survives_a_foreign_singleton_winner
+test_cycle_successor_link_outlives_the_claim_horizon
+test_unreadable_claim_is_retried_not_retired
 test_stopped_watcher_is_live_but_stale_then_exit_is_classified

@@ -47,7 +47,22 @@
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
 # arm/watcher identities, timestamps, exit/signal classification, beacon age,
-# lock identity before and after close, and successor disposition. The separate
+# lock identity before and after close, and successor disposition. A ledger
+# write waits a bounded interval for that log's lock and then gives up rather
+# than stalling the cycle, but never silently: the skip is reported on stderr
+# under its own prefix, so a missing record is never mistaken for a hand-over
+# that produced no successor.
+# A successor disposition is not written under that race at all. The successor
+# publishes its claim as its own file under state/.watch-cycle-links with one
+# lock-free atomic rename before it touches the ledger, and every later ledger
+# write re-applies whatever is still outstanding while it already holds the
+# log's lock, retiring a claim only once the applied ledger is committed. A
+# claim names its predecessor by arm pid AND recorded pid-identity, so a
+# recycled pid can never collect another cycle's link. Contention can
+# therefore delay a link but can never lose it, which is what keeps
+# successor=none meaning "no successor" instead of "a successor whose link lost
+# a race" - and the wait is never lengthened, because waiting longer cannot fix
+# a race the arm is not allowed to block on. The separate
 # state/.watch-triage.log remains exclusively the watcher's absorbed-wake debug
 # log and is never written here.
 #
@@ -107,16 +122,65 @@ CYCLE_LOG="$STATE/.watch-cycle-exits.log"
 CYCLE_LOG_LOCK="$STATE/.watch-cycle-exits.lock"
 CYCLE_LOG_MAX_BYTES=${FM_WATCH_CYCLE_LOG_MAX_BYTES:-262144}
 CYCLE_LOG_KEEP_LINES=${FM_WATCH_CYCLE_LOG_KEEP_LINES:-1000}
+# Bounded, and deliberately not configurable, because the ceiling is not ours to
+# pick: the extension retires an arm on FM_WATCH_ARM_RETIRE_TIMEOUT_MS (1000ms)
+# and a signal-trap ledger write runs before the arm can exit, while the attached
+# path takes two of these waits back to back. Twice this bound must still fit
+# inside that retire budget, or contention on a diagnostic log turns a healthy
+# hand-over into a killed successor - the outage this ledger exists to expose.
+CYCLE_LOG_LOCK_WAIT_MS=400
+# Durable successor claims: one file per claim, written without the ledger lock
+# and applied under it. A directory is what makes the claim lock-free: a claim
+# renamed in while a reconcile is running is simply not in that reconcile's
+# listing, so it survives to the next one instead of being overwritten by a
+# read-modify-write of a shared file.
+CYCLE_LINK="$STATE/.watch-cycle-links"
+# A claim whose predecessor record never appears (rotated away, or a hand-over
+# that never completed) is retired rather than kept forever.
+CYCLE_LINK_HORIZON_S=${FM_WATCH_CYCLE_LINK_HORIZON_S:-300}
 ARM_PID=${BASHPID:-$$}
 case "$CYCLE_LOG_MAX_BYTES" in ''|*[!0-9]*|0) CYCLE_LOG_MAX_BYTES=262144 ;; esac
 case "$CYCLE_LOG_KEEP_LINES" in ''|*[!0-9]*|0) CYCLE_LOG_KEEP_LINES=1000 ;; esac
+case "$CYCLE_LINK_HORIZON_S" in ''|*[!0-9]*|0) CYCLE_LINK_HORIZON_S=300 ;; esac
 
 # The lifecycle ledger is diagnostic evidence, not a supervision dependency.
-# Writes are bounded and best-effort so an observability failure cannot stall an
-# otherwise healthy watcher cycle.
+# Writes stay bounded so an observability failure cannot stall an otherwise
+# healthy watcher cycle, but a write this arm had to give up on is reported on
+# stderr rather than dropped, because a silently missing record reads exactly
+# like a hand-over that never happened.
 cycle_clean_field() {
   printf '%s' "$1" | tr '\t\r\n' '   ' | cut -c1-512
 }
+
+# An arm pid alone is not a durable key for "the arm cycle that closed": the
+# ledger and its claims outlive the process, so a recycled pid would match the
+# wrong record. Every row therefore carries the same pid-identity discipline the
+# supervision locks use, and a claim names its predecessor by pid AND identity.
+ARM_IDENTITY=$(cycle_clean_field "$(fm_pid_identity "$ARM_PID" 2>/dev/null || true)")
+
+# Resolve the predecessor's identity once, at startup, while it is still
+# resolvable: either the predecessor is alive and its identity recomputes, or it
+# has already closed and its ledger row carries the identity it recorded. A
+# predecessor that is gone without a row has nothing a claim could ever link.
+cycle_predecessor_identity() {
+  local predecessor=$1 identity=
+  identity=$(fm_pid_identity "$predecessor" 2>/dev/null || true)
+  if [ -z "$identity" ] && [ -f "$CYCLE_LOG" ]; then
+    identity=$(awk -F'\t' -v pid="arm_pid=$predecessor" '
+      $1 == pid {
+        for (i = 1; i <= NF; i += 1) if ($i ~ /^arm_identity=/) found = substr($i, 14)
+      }
+      END { if (found != "") print found }
+    ' "$CYCLE_LOG" 2>/dev/null || true)
+  fi
+  cycle_clean_field "$identity"
+}
+
+PREDECESSOR_IDENTITY=
+case "${FM_WATCH_PREDECESSOR_ARM_PID:-}" in
+  ''|*[!0-9]*) ;;
+  *) PREDECESSOR_IDENTITY=$(cycle_predecessor_identity "$FM_WATCH_PREDECESSOR_ARM_PID") ;;
+esac
 
 lock_snapshot() {
   local pid identity
@@ -162,21 +226,161 @@ cycle_signal_name() {
   kill -l "$signal_number" 2>/dev/null || printf '%s' "$signal_number"
 }
 
+cycle_log_lock_acquire() {
+  local what=$1 verb=${2:-skipped} waited=0
+  while ! fm_lock_try_acquire "$CYCLE_LOG_LOCK"; do
+    if [ "$waited" -ge "$CYCLE_LOG_LOCK_WAIT_MS" ]; then
+      echo "watcher-ledger: $what $verb - $CYCLE_LOG_LOCK stayed held for ${CYCLE_LOG_LOCK_WAIT_MS}ms" >&2
+      return 1
+    fi
+    sleep 0.02
+    waited=$((waited + 20))
+  done
+}
+
+# Record a successor claim durably, before any ledger lock is contested. The
+# claim is this arm's own file, published by rename, so it cannot collide with
+# another arm's claim and cannot be clobbered by a concurrent reconcile; no lock
+# is needed on this path.
+cycle_link_claim() {
+  local successor=$1 predecessor=${FM_WATCH_PREDECESSOR_ARM_PID:-} tmp
+  case "$predecessor" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  if [ -z "$PREDECESSOR_IDENTITY" ]; then
+    echo "watcher-ledger: successor claim dropped - predecessor $predecessor has no resolvable pid-identity" >&2
+    return 1
+  fi
+  if ! mkdir -p "$CYCLE_LINK" 2>/dev/null; then
+    echo "watcher-ledger: successor claim dropped - $CYCLE_LINK could not be created" >&2
+    return 1
+  fi
+  tmp="$CYCLE_LINK/.pending.$ARM_PID"
+  if printf 'predecessor=%s\tpredecessor_identity=%s\tsuccessor=%s\tclaimed_at=%s\n' \
+    "$predecessor" "$PREDECESSOR_IDENTITY" "$(cycle_clean_field "$successor")" "$(date +%s)" \
+    > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$CYCLE_LINK/$ARM_PID.claim" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  echo "watcher-ledger: successor claim dropped - $CYCLE_LINK/$ARM_PID.claim could not be written" >&2
+  return 1
+}
+
+# Apply every outstanding claim to the ledger, and retire the ones that are
+# applied or expired. The caller must already hold the ledger lock, so this
+# never waits on anything and never runs on a critical path.
+cycle_link_reconcile() {
+  local log_tmp claims_tmp retire_tmp now claim_file claim_line
+  [ -d "$CYCLE_LINK" ] || return 0
+  [ -f "$CYCLE_LOG" ] || return 0
+  log_tmp="$CYCLE_LOG.reconcile.$ARM_PID"
+  claims_tmp="$CYCLE_LINK/.claims.$ARM_PID"
+  retire_tmp="$CYCLE_LINK/.retire.$ARM_PID"
+  : > "$claims_tmp" 2>/dev/null || return 0
+  for claim_file in "$CYCLE_LINK"/*.claim; do
+    [ -f "$claim_file" ] || continue
+    # A claim that could not be read is not a claim that is invalid: enumerating
+    # it empty would retire it as malformed, so leave it for the next reconcile.
+    claim_line=$(head -n 1 "$claim_file" 2>/dev/null) || continue
+    [ -n "$claim_line" ] || continue
+    printf '%s\t%s\n' "$claim_file" "$claim_line" >> "$claims_tmp" 2>/dev/null || true
+  done
+  if [ ! -s "$claims_tmp" ]; then
+    rm -f "$claims_tmp" 2>/dev/null || true
+    return 0
+  fi
+  now=$(date +%s)
+  : > "$retire_tmp" 2>/dev/null || { rm -f "$claims_tmp" 2>/dev/null || true; return 0; }
+  if awk -v claims="$claims_tmp" -v retireout="$retire_tmp" \
+    -v horizon="$CYCLE_LINK_HORIZON_S" -v now="$now" '
+    BEGIN {
+      while ((getline claim < claims) > 0) {
+        if (claim == "") continue
+        count = split(claim, part, "\t")
+        if (count < 2) continue
+        file = part[1]
+        predecessor = ""; identity = ""; successor = ""; claimed_at = 0
+        for (i = 2; i <= count; i += 1) {
+          if (part[i] ~ /^predecessor=/) predecessor = substr(part[i], 13)
+          else if (part[i] ~ /^predecessor_identity=/) identity = substr(part[i], 22)
+          else if (part[i] ~ /^successor=/) successor = substr(part[i], 11)
+          else if (part[i] ~ /^claimed_at=/) claimed_at = substr(part[i], 12) + 0
+        }
+        if (predecessor !~ /^[0-9]+$/ || identity == "" || successor == "" || claimed_at <= 0) {
+          print file > retireout
+          continue
+        }
+        key = predecessor SUBSEP identity
+        if (key in want) {
+          if (claimed_at > claimtime[key] \
+            || (claimed_at == claimtime[key] && file > claimfile[key])) {
+            print claimfile[key] > retireout
+          } else {
+            print file > retireout
+            continue
+          }
+        }
+        want[key] = successor
+        claimfile[key] = file
+        claimtime[key] = claimed_at
+        expired[key] = (now - claimed_at > horizon)
+      }
+      close(claims)
+    }
+    {
+      rows[NR] = $0
+      row_pid = ""; row_identity = ""; unlinked = 0
+      count = split($0, field, "\t")
+      if (count < 1 || field[1] !~ /^arm_pid=/) next
+      row_pid = substr(field[1], 9)
+      for (i = 1; i <= count; i += 1) {
+        if (field[i] ~ /^arm_identity=/) row_identity = substr(field[i], 14)
+        else if (field[i] == "successor=none") unlinked = 1
+      }
+      if (row_identity == "" || !unlinked) next
+      key = row_pid SUBSEP row_identity
+      if (key in want) target[key] = NR
+    }
+    END {
+      for (key in target) rowkey[target[key]] = key
+      for (i = 1; i <= NR; i += 1) {
+        row = rows[i]
+        if (i in rowkey) {
+          key = rowkey[i]
+          if (sub(/\tsuccessor=none$/, "\tsuccessor=" want[key], row)) applied[key] = 1
+        }
+        print row
+      }
+      for (key in want) {
+        if (applied[key] || expired[key]) print claimfile[key] > retireout
+      }
+      close(retireout)
+    }
+  ' "$CYCLE_LOG" > "$log_tmp" 2>/dev/null; then
+    # Claims are retired only once the rewritten ledger is committed, so an
+    # application that never reached the file cannot delete its own evidence.
+    if mv -f "$log_tmp" "$CYCLE_LOG" 2>/dev/null; then
+      while IFS= read -r claim_file; do
+        [ -n "$claim_file" ] || continue
+        rm -f "$claim_file" 2>/dev/null || true
+      done < "$retire_tmp"
+    fi
+  fi
+  rm -f "$log_tmp" "$claims_tmp" "$retire_tmp" 2>/dev/null || true
+}
+
 cycle_log_append() {
-  local exit_code=$1 signal=$2 reason=$3 successor=$4 ended_at beacon_age lock_after size tmp raw i
+  local exit_code=$1 signal=$2 reason=$3 successor=$4 ended_at beacon_age lock_after size tmp raw
   [ "$cycle_active" -eq 1 ] || return 0
   ended_at=$(date +%s)
   beacon_age=$(fm_path_age "$BEAT")
   lock_after=$(lock_snapshot)
 
-  i=0
-  while ! fm_lock_try_acquire "$CYCLE_LOG_LOCK"; do
-    [ "$i" -lt 20 ] || return 0
-    sleep 0.02
-    i=$((i + 1))
-  done
-  printf 'arm_pid=%s\twatcher_pid=%s\torigin=%s\tstarted_at=%s\tended_at=%s\texit_code=%s\tsignal=%s\treason=%s\tbeacon_age=%s\tlock_before=%s\tlock_after=%s\tsuccessor=%s\n' \
+  cycle_log_lock_acquire 'cycle record' || return 0
+  printf 'arm_pid=%s\tarm_identity=%s\twatcher_pid=%s\torigin=%s\tstarted_at=%s\tended_at=%s\texit_code=%s\tsignal=%s\treason=%s\tbeacon_age=%s\tlock_before=%s\tlock_after=%s\tsuccessor=%s\n' \
     "$ARM_PID" \
+    "$ARM_IDENTITY" \
     "$(cycle_clean_field "$cycle_watcher_pid")" \
     "$(cycle_clean_field "$cycle_origin")" \
     "$cycle_started_at" \
@@ -188,6 +392,10 @@ cycle_log_append() {
     "$(cycle_clean_field "$cycle_lock_before")" \
     "$(cycle_clean_field "$lock_after")" \
     "$(cycle_clean_field "$successor")" >> "$CYCLE_LOG" 2>/dev/null || true
+
+  # After this arm's own row exists, so a predecessor that is still running its
+  # close can link the row it just wrote instead of deferring it to a horizon.
+  cycle_link_reconcile
 
   size=$(wc -c < "$CYCLE_LOG" 2>/dev/null | tr -d '[:space:]')
   case "$size" in
@@ -213,36 +421,15 @@ cycle_log_append() {
 # one-record-per-cycle ledger captures the actual successor outcome without an
 # extra synthetic lifecycle row.
 cycle_mark_predecessor_successor() {
-  local successor=$1 predecessor=${FM_WATCH_PREDECESSOR_ARM_PID:-} i tmp
+  local successor=$1 predecessor=${FM_WATCH_PREDECESSOR_ARM_PID:-}
   case "$predecessor" in
     ''|*[!0-9]*) return 0 ;;
   esac
+  # Durable first. Losing the lock below can defer the link, never drop it.
+  cycle_link_claim "$successor"
   [ -f "$CYCLE_LOG" ] || return 0
-  i=0
-  while ! fm_lock_try_acquire "$CYCLE_LOG_LOCK"; do
-    [ "$i" -lt 20 ] || return 0
-    sleep 0.02
-    i=$((i + 1))
-  done
-  tmp="$CYCLE_LOG.link.$ARM_PID"
-  awk -v target="arm_pid=$predecessor" -v replacement="successor=$(cycle_clean_field "$successor")" '
-    {
-      lines[NR] = $0
-      count = split($0, fields, "\t")
-      if (fields[1] == target) {
-        for (i = 1; i <= count; i += 1) {
-          if (fields[i] == "successor=none") last = NR
-        }
-      }
-    }
-    END {
-      for (i = 1; i <= NR; i += 1) {
-        if (i == last) sub(/\tsuccessor=none$/, "\t" replacement, lines[i])
-        print lines[i]
-      }
-    }
-  ' "$CYCLE_LOG" > "$tmp" 2>/dev/null && mv -f "$tmp" "$CYCLE_LOG" 2>/dev/null
-  rm -f "$tmp" 2>/dev/null || true
+  cycle_log_lock_acquire 'successor link' deferred || return 0
+  cycle_link_reconcile
   fm_lock_release "$CYCLE_LOG_LOCK"
 }
 
@@ -619,6 +806,7 @@ while :; do
       exit $?
     fi
     # Another watcher won the singleton; our child stood down.
+    cycle_mark_predecessor_successor "attached:$HEALTHY_PID"
     wait "$child"
     rc=$?
     owned_child_finished "$rc"
