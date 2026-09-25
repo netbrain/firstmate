@@ -1,0 +1,5 @@
+# stderr fra arm-en under en opptatt ledger-lås (successor-arm.err):
+watcher-ledger: successor link deferred - /tmp/fm-watcher-lock-tests.onjno8/cycle-ledger-link-deferred/state/.watch-cycle-exits.lock stayed held for 400ms
+
+# linjer under prefiksene reparasjons-relayene plukker (^watcher:|signal:|stale:|check:|heartbeat) - skal være tom:
+# (slutt)

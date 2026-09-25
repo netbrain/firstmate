@@ -1,0 +1,18 @@
+=== cycle-ledger-link-deferred
+  arm_pid=793181  watcher_pid=793203  reason=actionable-check  successor=started:794527
+  arm_pid=794494  watcher_pid=794527  reason=arm-interrupted  successor=none
+=== cycle-ledger-link-foreign-winner
+  arm_pid=798507  watcher_pid=798561  reason=arm-interrupted  successor=attached:799942
+  arm_pid=800088  watcher_pid=805047  reason=nonzero-exit  successor=none
+=== cycle-ledger-link-horizon
+  arm_pid=806231  watcher_pid=806307  reason=actionable-check  successor=started:811122
+  arm_pid=811028  watcher_pid=811122  reason=arm-interrupted  successor=none
+=== cycle-ledger-link-self
+  arm_pid=795705  watcher_pid=795730  reason=arm-interrupted  successor=attached:795730
+  arm_pid=796197  watcher_pid=795730  reason=arm-interrupted  successor=none
+=== cycle-ledger-link-unreadable
+  arm_pid=816512  watcher_pid=816570  reason=actionable-check  successor=started:818158
+  arm_pid=818087  watcher_pid=818158  reason=arm-interrupted  successor=none
+  arm_pid=819512  watcher_pid=819536  reason=arm-interrupted  successor=none
+=== cycle-ledger
+  arm_pid=792197  watcher_pid=792221  reason=arm-interrupted  successor=none
