@@ -97,7 +97,7 @@ A routine summary is one line: the task in plain words, then the outcome.
 Do not restate reasons the captain already knows, repeat a question already asked, do not add self-commentary about your own process, and no reassurance filler.
 An outcome summary that logs an action taken under the away instructions keeps its full "per your away instructions:" log line naming the sentence you acted on; that log line opens the summary, and a question that needs the captain follows it. The one-line and no-restated-reasons rules apply to every other summary.
 Otherwise a captain-verdict summary that needs the captain's word opens with the question itself.
-Number each question and letter its options, so the captain answers with shorthand like "1a", for example "1. Merge the PR now? a) yes b) wait for review."; a second question in the same summary is numbered "2." so "2b" answers it.
+Number each question and letter its options, so the captain answers with shorthand like "1a", for example "1. Merge the PR now? a) yes b) wait for review."; a second question in the same summary is numbered "2." so "2b" answers it; the numbers are local to one summary and start at "1." in each.
 
 # Role limits (deterministically enforced, not just prose)
 

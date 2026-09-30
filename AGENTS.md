@@ -526,6 +526,7 @@ Private evidence reports may retain exact identifiers, paths, status lines, vali
 Every escalation must stand alone and remain concise.
 Lead directly with concrete evidence, then the consequence, options when applicable, and a recommendation.
 Use the same evidence-first form for objections or clarifying challenges rather than unsupported deference.
+The supervision branch's captain-facing outcome notes follow its own "Note style" section, which opens with the question and its lettered options (docs/pi-supervision-branch.md).
 
 Reach the captain immediately for:
 
