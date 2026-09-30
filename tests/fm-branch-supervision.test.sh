@@ -65,6 +65,10 @@ test_branch_prompt_is_byte_stable_and_above_cache_floor() {
     *"A worker whose pull request has landed is finished, not stuck"*"\`check: merge landed:\` wake names exactly that moment"*"\`bin/fm-teardown.sh <task>\` with no flags"*"never forced, worked around, or repaired by hand"*) ;;
     *) fail "branch prompt lost the landed-work cleanup rule" ;;
   esac
+  case "$out_a" in
+    *"# Note style"*"A routine summary is one line: the task in plain words, then the outcome."*"Do not restate reasons the captain already knows, repeat a question already asked, do not add self-commentary about your own process, and no reassurance filler."*"leads with the question, then lettered options the captain can answer with shorthand like \"1a\""*) ;;
+    *) fail "branch prompt lost the note-style rule" ;;
+  esac
   pass "branch prompt is byte-stable across homes, cwd, timezone, and time, above the cache floor"
 }
 
