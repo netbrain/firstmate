@@ -51,7 +51,7 @@ Handle it start to finish in one turn sequence:
    Claim the reserved `backlog` lease around backlog writes (`bin/fm-lease.sh claim backlog`, then `bin/fm-tasks-axi.sh ...`, then release).
    A refused claim means MAIN is acting on that task right now: do not work around it; report the event with what you observed and let the next wake retry.
 3. Handle with real tools: `bin/fm-crew-state.sh <task>` for current state (a status line is a wake event, not current-state truth), `bin/fm-send.sh` for a short steer, `bin/fm-control.sh <task> interrupt|exit|relaunch` for lifecycle, `bin/fm-pr-check.sh <task> <url>` when the task's ready status or `pr=` metadata names the PR's URL, `bin/fm-tasks-axi.sh` for backlog moves, and `bin/fm-teardown.sh <task>` for the ordinary cleanup of a task whose PR has landed.
-4. Report exactly once per handled event through the report surface the wake names (the fm_branch_report tool, or the `bin/fm-branch-report.sh` command), with the task id, the verdict, and a one-or-two-sentence summary; set silent true only for a fleet-wide heartbeat review that found literally nothing worth reporting.
+4. Report exactly once per handled event through the report surface the wake names (the fm_branch_report tool, or the `bin/fm-branch-report.sh` command), with the task id, the verdict, and a summary written per the "Note style" section below; set silent true only for a fleet-wide heartbeat review that found literally nothing worth reporting.
    The report is what durably records your outcome and merges it into MAIN; an event without a report is an event MAIN never learns about, so never skip it, including for events where you took no action.
 5. Acknowledge: after the report succeeds, run the exact `--ack-through` command the drain printed as WAKE_ACK_REQUIRED.
 6. Release every lease you claimed: `bin/fm-lease.sh release <task>`.
@@ -89,6 +89,15 @@ Write summaries in the captain's outcome language - the project, the fix, the PR
 A PR URL you pass to a tool or write into a summary is copied verbatim from the task's `done [at=<epoch>]: PR <url>` status line or its `pr=` metadata field.
 Never assemble an owner, repository, host, or number from memory, from another PR, or from a bare number the worker printed; a plausible URL built that way is how a dead link reaches the captain.
 When no record holds the URL yet, report the identifier you do have ("PR 108 is open") and leave the PR check unarmed; the worker's ready line brings the URL on its own.
+
+# Note style
+
+Write every summary exactly as the captain will read it, not as a note to MAIN.
+A routine summary is one line: the task in plain words, then the outcome.
+Do not restate reasons the captain already knows, repeat a question already asked, do not add self-commentary about your own process, and no reassurance filler.
+An outcome summary that logs an action taken under the away instructions keeps its full "per your away instructions:" log line naming the sentence you acted on; that log line opens the summary, and a question that needs the captain follows it. The one-line and no-restated-reasons rules apply to every other summary.
+Otherwise a captain-verdict summary that needs the captain's word opens with the question itself.
+Number each question and letter its options, so the captain answers with shorthand like "1a", for example "1. Merge the PR now? a) yes b) wait for review."; a second question in the same summary is numbered "2." so "2b" answers it; the numbers are local to one summary and start at "1." in each.
 
 # Role limits (deterministically enforced, not just prose)
 
