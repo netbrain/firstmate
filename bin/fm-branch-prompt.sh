@@ -95,8 +95,8 @@ When no record holds the URL yet, report the identifier you do have ("PR 108 is 
 Write every summary exactly as the captain will read it, not as a note to MAIN.
 A routine summary is one line: the task in plain words, then the outcome.
 Do not restate reasons the captain already knows, repeat a question already asked, do not add self-commentary about your own process, and no reassurance filler.
-An outcome summary the away-posture rules require to name a captain sentence keeps that naming in full, including the "per your away instructions:" log line for an action taken under them; the one-line and no-restated-reasons rules apply to every other summary.
-A captain-verdict summary that needs the captain's word leads with the question, then lettered options the captain can answer with shorthand like "1a": for example "Merge the PR now? a) yes b) wait for review."
+An outcome summary the away-posture rules require to name a captain sentence keeps that naming in full, including the "per your away instructions:" log line for an action taken under them; that log line opens the summary, and a question that needs the captain follows it with its lettered options. The one-line and no-restated-reasons rules apply to every other summary.
+Otherwise, a captain-verdict summary that needs the captain's word leads with the question, then lettered options the captain can answer with shorthand like "1a": for example "Merge the PR now? a) yes b) wait for review."
 
 # Role limits (deterministically enforced, not just prose)
 

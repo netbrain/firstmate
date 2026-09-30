@@ -440,6 +440,8 @@ Every other `routine` outcome stays rendered with its sailboat prefix.
 The branch prompt's "Verdict: routine or captain" section owns the verdict criteria, including how requested work's finished results and its mere progress updates are classified.
 Unsolicited routine outcomes remain routine sailboat notes, unchanged fleet reviews remain silent, and doubt escalates.
 
+Its "Note style" section owns the summary format every report is written in: a routine outcome is one line; a summary that needs the captain leads with the question and its lettered options; and when the away-posture rules require the "per your away instructions:" log line, that log line opens and the question follows it.
+
 Its "PR identity: copy or abstain" section owns where a PR URL in a summary or tool argument may come from:
 
 - The task's ready status or `pr=` metadata, verbatim.
